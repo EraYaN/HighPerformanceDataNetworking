@@ -1,0 +1,90 @@
+[
+    {
+        "type": "PASS",
+        "description" : "Allow ICMP",
+        "protocols":{
+            "icmp": {
+            }
+        }  
+    },
+    {
+        "type": "MODIFY",
+        "fields":{
+            "eth_dst": "00:00:00:00:00:03",
+            "ipv4_dst": "10.0.0.3"
+        },
+        "description": "Redirect HTTP to proxy",
+        "protocols":{
+            "ipv4": {
+                "inverse":true,
+                "ipv4_src":"10.0.0.3"
+            },
+            "tcp": {
+                "tcp_dst" : 80
+            }
+        }  
+    },
+    {
+        "type": "PASS",
+        "description": "Allow HTTP Proxy upstream",
+        "protocols":{
+            "ipv4": {
+                "ipv4_src":"10.0.0.3"
+            },
+            "tcp": {
+                "tcp_dst" : 80
+            }
+        }  
+    },
+    {
+        "type": "PASS",
+        "description" : "Allow HTTP (return)",
+        "protocols":{
+            "ipv4": {
+                "inverse":true,
+                "ipv4_src":"10.0.0.3"
+            },
+            "tcp": {
+                "tcp_src" : 80
+            }
+        }  
+    },
+    {
+        "type": "MODIFY",
+        "fields":{
+            "eth_src": "00:00:00:00:00:01",
+            "ipv4_src": "10.0.0.1"
+        },
+        "description" : "Redirect HTTP to proxy (return)",
+        "protocols":{
+            "ipv4": {
+                "ipv4_src":"10.0.0.3"
+            },
+            "tcp": {
+                "tcp_src" : 80
+            }
+        }  
+    },
+    {
+        "type":"PASS",
+        "description": "Allow iPerf TCP traffic",
+        "protocols":{
+            "ipv4":{                
+            },
+            "tcp":{
+                "tcp_dst" : 5001
+            }
+        }
+    },
+    {
+        "type":"PASS",
+        "description": "Allow iPerf TCP traffic (return)",
+        "protocols":{
+            "ipv4":{
+            },
+            "tcp":{
+                "tcp_src" : 5001
+            }
+        }
+    }
+]

@@ -1,43 +1,51 @@
-# Copyright (C) 2011 Nippon Telegraph and Telephone Corporation.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#    http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-# implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+"""
+This is a Basic L2 Switch that turned into a somewhat malicious firewall. (To be fair normal firewalls can also do this, but they mostly are not SDN for increased security, and changing packets is not really a thing they should do.)
+"""
+import logging
+
+import os
 
 from ryu.base import app_manager
 from ryu.controller import ofp_event
-from ryu.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER
+from ryu.controller.handler import HANDSHAKE_DISPATCHER, CONFIG_DISPATCHER, MAIN_DISPATCHER
 from ryu.controller.handler import set_ev_cls
 from ryu.ofproto import ofproto_v1_3
+from ryu.ofproto import ofproto_parser
 from ryu.lib.packet import packet
 from ryu.lib.packet import ethernet
 from ryu.lib.packet import ether_types
-import logging
+import ryu.utils as ryuutils
 
+import FirewallTools # __main__ case
 
-class SimpleSwitch13(app_manager.RyuApp):
+SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
+
+import pprint
+pp = pprint.PrettyPrinter(indent=4)
+
+class SimpleFirewall(app_manager.RyuApp):
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
+    LOGGER_NAME = "Controller"
 
     def __init__(self, *args, **kwargs):
-        super(SimpleSwitch13, self).__init__(*args, **kwargs)
+        super(SimpleFirewall, self).__init__(*args, **kwargs)
         self.mac_to_port = {}
-        self.logger.setLevel(logging.DEBUG)
-        ch = logging.StreamHandler()
-        # create formatter and add it to the handler
-        formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-        ch.setFormatter(formatter)
-        # add the handler to the logger
-        self.logger.addHandler(ch)
+        globallogger = logging.getLogger()
+        globallogger.handlers = []
+        self.logger.setLevel(logging.INFO)
+        
+        # create formatter and add it to all handlers
+        formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s',datefmt="%H:%M:%S")
+        handler = logging.StreamHandler()
+        handler.setFormatter(formatter)
+        
+        # add the handler to the logger    
+        #self.logger.addHandler(handler) 
+        globallogger.addHandler(handler)   
+        
         self.logger.info('Started controller.')
+        self.matcher = FirewallTools.RuleMatcher(FirewallTools.RuleParser(os.path.join(SCRIPT_DIR,'firewall-rules.json')))
+        self.logger.info('Initialized the Rule Matching engine.')
 
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
     def switch_features_handler(self, ev):
@@ -70,8 +78,8 @@ class SimpleSwitch13(app_manager.RyuApp):
         else:
             mod = parser.OFPFlowMod(datapath=datapath, priority=priority,
                                     match=match, instructions=inst)
-        datapath.send_msg(mod)
-
+        self.logger.debug("Add flow result: {0} for actions {1}".format(datapath.send_msg(mod),actions))
+    
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def _packet_in_handler(self, ev):
         # If you hit this you might want to increase
@@ -88,37 +96,74 @@ class SimpleSwitch13(app_manager.RyuApp):
         pkt = packet.Packet(msg.data)
         eth = pkt.get_protocols(ethernet.ethernet)[0]
 
+        #Send it to packet matcher
+        (rule_matched, packet_data, rule_action) = self.matcher.match(pkt)
+        
+        if rule_matched is not None:
+            self.logger.info("The result of the matcher was {0} on the rule {1}".format(rule_action, rule_matched.description))
+        else:
+            self.logger.info("Not one rule was matched, using {0} action.".format(rule_action))
+
         if eth.ethertype == ether_types.ETH_TYPE_LLDP:
             # ignore lldp packet
             return
         dst = eth.dst
+        orig_dst = eth.dst
         src = eth.src
 
         dpid = datapath.id
         self.mac_to_port.setdefault(dpid, {})
 
-        self.logger.info("packet in %s %s %s %s", dpid, src, dst, in_port)
+        if rule_action == FirewallTools.common.ActionType.DROP:
+            self.logger.debug("Dropping packet %s %s %s %s", dpid, src, dst, in_port)
+        elif rule_action == FirewallTools.common.ActionType.PASS:
+            self.logger.debug("Passing packet %s %s %s %s", dpid, src, dst, in_port)
+        elif rule_action == FirewallTools.common.ActionType.MODIFY:
+            self.logger.debug("Fields to modify: %s",pp.pformat(rule_matched.fields))
+            if 'eth_dst' in rule_matched.fields:
+                self.logger.debug("Setting destination from %s to %s",dst, rule_matched.fields['eth_dst'])
+                dst = rule_matched.fields['eth_dst']
+            self.logger.debug("Modifying packet %s %s %s %s", dpid, src, dst, in_port)
+        else:
+            self.logger.debug("Dropping packet %s %s %s %s (fallback)", dpid, src, dst, in_port)
 
         # learn a mac address to avoid FLOOD next time.
         self.mac_to_port[dpid][src] = in_port
-
+        
         if dst in self.mac_to_port[dpid]:
             out_port = self.mac_to_port[dpid][dst]
         else:
             out_port = ofproto.OFPP_FLOOD
-
-        actions = [parser.OFPActionOutput(out_port)]
+        
+        actions = []
+        if rule_action == FirewallTools.common.ActionType.MODIFY:
+            for field in rule_matched.fields:
+                actions.append(parser.OFPActionSetField(**{field: rule_matched.fields[field]}))
+            actions.append(parser.OFPActionOutput(out_port))
+        elif rule_action == FirewallTools.common.ActionType.DROP:
+            pass
+        elif rule_action == FirewallTools.common.ActionType.PASS:
+            actions.append(parser.OFPActionOutput(out_port))
+            
+        
+        self.logger.debug("Actions to perform: %s", pp.pformat(actions))
 
         # install a flow to avoid packet_in next time
         if out_port != ofproto.OFPP_FLOOD:
-            match = parser.OFPMatch(in_port=in_port, eth_dst=dst)
+            if rule_matched is not None and len(packet_data) > 0:
+                match_data = rule_matched.to_opfmatch_data(packet_data=packet_data,in_port=in_port, eth_dst=orig_dst)
+                match = parser.OFPMatch(**match_data)
+            else:
+                match = parser.OFPMatch(in_port=in_port, eth_dst=dst)
             # verify if we have a valid buffer_id, if yes avoid to send both
             # flow_mod & packet_out
             if msg.buffer_id != ofproto.OFP_NO_BUFFER:
                 self.add_flow(datapath, 1, match, actions, msg.buffer_id)
+                self.logger.debug("Had buffer ID")
                 return
             else:
                 self.add_flow(datapath, 1, match, actions)
+                self.logger.debug("Had no buffer ID")
         data = None
         if msg.buffer_id == ofproto.OFP_NO_BUFFER:
             data = msg.data
@@ -126,3 +171,30 @@ class SimpleSwitch13(app_manager.RyuApp):
         out = parser.OFPPacketOut(datapath=datapath, buffer_id=msg.buffer_id,
                                   in_port=in_port, actions=actions, data=data)
         datapath.send_msg(out)
+
+    @set_ev_cls(ofp_event.EventOFPErrorMsg, [HANDSHAKE_DISPATCHER, CONFIG_DISPATCHER, MAIN_DISPATCHER])
+    def _error_msg_handler(self, ev):
+        msg = ev.msg
+
+        ofp = msg.datapath.ofproto
+        (version, msg_type, msg_len, xid) = ofproto_parser.header(msg.data)
+        self.logger.error('EventOFPErrorMsg received.')
+        self.logger.error(
+            'version=%s, msg_type=%s, msg_len=%s, xid=%s', hex(msg.version),
+            hex(msg.msg_type), hex(msg.msg_len), hex(msg.xid))
+        self.logger.error(
+            ' `-- msg_type: %s', ofp.ofp_msg_type_to_str(msg.msg_type))
+        self.logger.error(
+            "OFPErrorMsg(type=%s, code=%s, data=b'%s')", hex(msg.type),
+            hex(msg.code), ryuutils.binary_str(msg.data))
+        self.logger.error(
+            ' |-- type: %s', ofp.ofp_error_type_to_str(msg.type))
+        self.logger.error(
+            ' |-- code: %s', ofp.ofp_error_code_to_str(msg.type, msg.code))
+        self.logger.error(
+            ' `-- data: version=%s, msg_type=%s, msg_len=%s, xid=%s',
+            hex(version), hex(msg_type), hex(msg_len), hex(xid))
+        self.logger.error(
+            '     `-- msg_type: %s', ofp.ofp_msg_type_to_str(msg_type))
+        
+        
