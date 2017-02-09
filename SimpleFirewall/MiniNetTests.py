@@ -79,6 +79,8 @@ def firewallTests(net):
 
         print("Stopping HTTP server")
         print(http_server.cmd("kill %python"))
+		print("Stopping HTTP proxy ")
+		print(http_proxy.cmd("kill %python"))
 
         dumpflows(s1)
         print("Done")
